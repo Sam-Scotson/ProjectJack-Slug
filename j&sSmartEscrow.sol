@@ -1,114 +1,145 @@
-//++Project JackenSlug++ "FUCK SOLICITORS"
 //SPDX-Licence-Identifier: GPL-3.0
-pragm solidity ^0.8.4;
+pragma solidity ^0.8.0;
 //////////////////////////////////////////////////////////////////////////////
-//Purchase contract
-contract Purchase {
-    uint public value;
-    address payable public seller;
-    address payable public buyer;
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
 
-    enum State {created, locked, release, inactive}
-    //The state variable has a default value of the first member, 'State.created'
-    State public state;
+contract Escrow is Ownable {
+    using Strings for uint256;
 
-    modifier condition(bool condition_) {
-        require(condition_);
+    enum EscrowState { InProgress, Completed, Refunded, Disputed }
+
+    struct Transaction {
+        address payable buyer;
+        address payable seller;
+        uint256 amount;
+        EscrowState state;
+        bool exists;
+        string encryptedItemMetadata;
+        bytes32 itemHash;
+        bool disputeResolved;
+    }
+
+    mapping(uint256 => Transaction) public transactions;
+    uint256 public transactionCount;
+
+    uint256 public escrowDuration; // Duration in seconds
+    uint256 public escrowFee; // Fee in wei
+
+    event EscrowCreated(uint256 indexed transactionId, address indexed buyer, address indexed seller, uint256 amount);
+    event EscrowCompleted(uint256 indexed transactionId);
+    event EscrowRefunded(uint256 indexed transactionId);
+    event EscrowDisputed(uint256 indexed transactionId, bytes32 itemHash);
+    event EscrowDisputeResolved(uint256 indexed transactionId);
+
+    modifier onlyTransactionParticipant(uint256 transactionId) {
+        require(
+            transactions[transactionId].exists &&
+            (msg.sender == transactions[transactionId].buyer || msg.sender == transactions[transactionId].seller),
+            "Only transaction participants can perform this action"
+        );
         _;
     }
 
-    //Only the buyer can call this function
-    error OnlyBuyer();
-    //Only the seller can call this function
-    error OnlySeller();
-    //This function cannot be called at the current state
-    error InvalidState();
-    //The provided value has to be even
-    error ValueNotEven();
-
-    modifier OnlyBuyer() {
-        if (msg.sender != buyer)
-            revert OnlyBuyer();
-        _;
+    constructor(uint256 duration, uint256 fee) {
+        escrowDuration = duration;
+        escrowFee = fee;
     }
 
-    modifier OnlySeller() {
-        if (msg.sender != seller)
-            revert OnlyBuyer();
-        _;
+    function createEscrow(
+        address payable seller,
+        string calldata encryptedItemMetadata,
+        bytes32 itemHash
+    ) external payable returns (uint256) {
+        require(msg.value > escrowFee, "Amount should be greater than the escrow fee");
+
+        transactionCount++;
+        Transaction storage transaction = transactions[transactionCount];
+        transaction.buyer = payable(msg.sender);
+        transaction.seller = seller;
+        transaction.amount = msg.value - escrowFee;
+        transaction.state = EscrowState.InProgress;
+        transaction.exists = true;
+        transaction.encryptedItemMetadata = encryptedItemMetadata;
+        transaction.itemHash = itemHash;
+
+        emit EscrowCreated(transactionCount, msg.sender, seller, transaction.amount);
+
+        return transactionCount;
     }
 
-    modifier inState(State state_) {
-        if (state != state_)
-            revert InvalidState();
-        _;
+    function completeEscrow(uint256 transactionId) external onlyTransactionParticipant(transactionId) {
+        Transaction storage transaction = transactions[transactionId];
+        require(transaction.state == EscrowState.InProgress, "Escrow is not in progress");
+
+        transaction.state = EscrowState.Completed;
+
+        emit EscrowCompleted(transactionId);
+
+        payable(transaction.seller).transfer(transaction.amount);
     }
 
-    event Aborted();
-    event PurchaseConfirmed();
-    event ItemReceived();
-    event SellerRefunded();
+    function refundEscrow(uint256 transactionId) external onlyTransactionParticipant(transactionId) {
+        Transaction storage transaction = transactions[transactionId];
+        require(transaction.state == EscrowState.InProgress, "Escrow is not in progress");
 
-    //Ensure that 'msg.value' is an even number
-    //Division will truncate if it is an odd number
-    //Check via multiplication that it wasn't an odd number
-    constuctor() payable {
-        seller=payable(msg.sender);
-        value=msg.value/2;
-        if((2*value)!=msg.value)
-            revert ValueNotEven();
+        transaction.state = EscrowState.Refunded;
+
+        emit EscrowRefunded(transactionId);
+
+        payable(transaction.buyer).transfer(transaction.amount);
     }
 
-    //Abort the purchase and reclaim the ETH
-    //Can only be called by the seller before the contract is locked
-    function abort()
-        external
-        onlySeller
-        inState(State.Created)
-    {
-        emit Aborted();
-        state=State.Inactive;
-        //We use transfer here directly. It is reentrancy-safe, because it is the 
-        //last call in this function and we already changed the state.
-        seller.transfer(address(this).balance);
+    function disputeEscrow(uint256 transactionId) external onlyTransactionParticipant(transactionId) {
+        Transaction storage transaction = transactions[transactionId];
+        require(transaction.state == EscrowState.InProgress, "Escrow is not in progress");
+
+        transaction.state = EscrowState.Disputed;
+
+        emit EscrowDisputed(transactionId, transaction.itemHash);
     }
 
-        //confirm the purchase as buyer. Transaction has to include 2*value ETH.
-        //The ETH will be locked until confirmReceived is called.
-    function confirmPurchase()
-        external
-        inState(State.Created)
-        condition(msg.value==(2*value))
-        payable
-    {
-        emit PurchaseConfirmed();
-        buyer=payable(msg.sender);
-        state=State.Locked;
+    function resolveDispute(uint256 transactionId, bool isResolved) external onlyOwner {
+        Transaction storage transaction = transactions[transactionId];
+        require(transaction.state == EscrowState.Disputed, "Escrow is not disputed");
+
+        transaction.disputeResolved = isResolved;
+
+        if (isResolved) {
+            transaction.state = EscrowState.Completed;
+
+            emit EscrowDisputeResolved(transactionId);
+
+            payable(transaction.seller).transfer(transaction.amount);
+        } else {
+            transaction.state = EscrowState.Refunded;
+
+            emit EscrowDisputeResolved(transactionId);
+
+            payable(transaction.buyer).transfer(transaction.amount);
+        }
     }
 
-    //confirm that the buyer received the item.
-    //This will release the locked ETH.
-    function confirmReceived()
-        external
-        OnlyBuyer
-        inState(State.Locked)
-    {
-        emit ItemReceived();
-        //It is important change the state first because otherwise the contract
-        //called using 'send' below can call in again here.
-        state=State.Release;
-        buyer.transfer(value); 
+    function setEscrowDuration(uint256 duration) external onlyOwner {
+        escrowDuration = duration;
     }
-    //This function refunds the seller, i.e. pays back the locked funds of the seller.
-    function refundSeller()
-        external
-        onlySeller
-        inState(State.Release)
-    {
-        emit SellerRefunded();
-        //It is important to change the state first because otherwise, the contacts
-        //called using 'send' below can call in again here
-        state=State.Inactive;
-        seller.transfer(3*value);
+
+    function setEscrowFee(uint256 fee) external onlyOwner {
+        escrowFee = fee;
+    }
+
+    function getTransactionMetadata(uint256 transactionId) external view returns (string memory) {
+        return transactions[transactionId].encryptedItemMetadata;
+    }
+
+    function getItemHash(uint256 transactionId) external view returns (bytes32) {
+        return transactions[transactionId].itemHash;
+    }
+
+    function withdrawBalance() external {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No balance to withdraw");
+
+        payable(owner()).transfer(balance);
     }
 }
